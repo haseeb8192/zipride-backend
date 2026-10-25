@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>GadiBook Live Map Test</title>
+  <!-- Socket.io connection kosam -->
+ <script src="http://localhost:3000/socket.io/socket.io.js"></script>
+</head>
+<body style="font-family: Arial; padding: 20px;">
+  <h2>GadiBook Live Tracking Test 🚗</h2>
+  <p>Status: <b id="status" style="color: red;">Not Connected 🔴</b></p>
+  
+  <button onclick="sendLocation()" style="padding: 15px; background: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer;">
+    📍 Send Fake Location (Driver)
+  </button>
+
+  <script>
+    // Mana server ki connect avuthunnam
+    const socket = io("http://localhost:3000");
+
+    socket.on("connect", () => {
+      document.getElementById("status").innerText = "Connected to Server! 🟢";
+      document.getElementById("status").style.color = "green";
+    });
+
+    // Button nokkinappudu ee function run avuthundi
+    function sendLocation() {
+      const fakeData = {
+        driver_id: 101,
+        lat: 17.2473, // Hyderabad (LB Nagar hub anukundam)
+        lng: 78.5536
+      };
+      
+      // Server ki data live ga pampisthunnam
+      socket.emit("update-location", fakeData);
+      console.log("Location sent!");
+    }
+  </script>
+</body>
+</html>
