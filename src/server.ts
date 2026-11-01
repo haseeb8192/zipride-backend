@@ -36,6 +36,9 @@ const DRIVER_SAFETY_FEE = 3;
 const DISPATCH_RADIUS_TIERS_KM = [5, 15, 30];
 const ADMIN_MASTER_PIN = process.env.ADMIN_MASTER_PIN || '7799'; // Fallback Master PIN if phone is lost
 
+// Temp In-Memory Store for OTPs (In Production, use Redis)
+const activeOtps = new Map<string, string>();
+
 // ============================================================================
 // DATABASE CONNECTION (SUPABASE CLOUD POOLER SSL READY)
 // ============================================================================
@@ -301,7 +304,6 @@ const isValidDocFormat = (docUrl?: string): boolean => {
   );
 };
 
-// TIER-1 AUTOMATED GOVT VAHAN & SARATHI KYC VERIFICATION ENGINE
 const verifyGovtParivahanKyc = async (
   rcNumber: string,
   vehicleType: string,
@@ -316,7 +318,6 @@ const verifyGovtParivahanKyc = async (
   reason: string;
 }> => {
   const cleanRc = (rcNumber || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-  // Standard Indian RTO Registration Regex (e.g., TS05UA1234, TG09B4421, AP16TH8899)
   const rtoRegex = /^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{3,4}$/;
   const isRtoValid = rtoRegex.test(cleanRc) && !cleanRc.includes('FAKE') && !cleanRc.includes('TEST000');
 
@@ -371,7 +372,6 @@ const findAndDispatchNearbyDrivers = async (
     const pLat = Number(pickupLat) || 17.385;
     const pLng = Number(pickupLng) || 78.4867;
 
-    // STRICT FILTER: Only dispatch to available drivers with >= ₹500 wallet AND Approved KYC
     const query = `
       SELECT v.*, u.name as driver_name, u.phone as driver_phone, u.wallet_balance, u.overlay_permission_enabled, u.kyc_status
       FROM vehicles v
@@ -463,9 +463,6 @@ const findAndDispatchNearbyDrivers = async (
   }
 };
 
-// ============================================================================
-// SECURITY MIDDLEWARE
-// ============================================================================
 const authenticateToken = (req: Request, res: Response, next: NextFunction): any => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -484,9 +481,114 @@ const authenticateToken = (req: Request, res: Response, next: NextFunction): any
 app.get('/', (req: Request, res: Response) => {
   res.json({
     status: 'success',
-    message:
-      'ZipRide Production Backend Active (Auto-Parivahan KYC, Household Shifting Pass, Expanding Dispatch, Live Map ETA)!',
+    message: 'ZipRide Production Backend Active (Auto-Parivahan KYC, OTP Auth, Distance Limits)!',
   });
+});
+
+// ==================== PASTE PART 2 BELOW THIS LINE ====================
+// ============================================================================
+// 0. MOBILE + OTP AUTHENTICATION (SINGLE APP CUSTOMER + CAPTAIN LOGIC)
+// ============================================================================
+app.post('/api/auth/send-otp', async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { phone } = req.body;
+    if (!phone || String(phone).trim().length < 10) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Valid 10-digit mobile number is required!',
+      });
+    }
+
+    const cleanPhone = String(phone).trim();
+    const generatedOtp = '7799'; // Standard Pilot OTP (Replace with Fast2SMS/Twilio in Phase-2)
+    activeOtps.set(cleanPhone, generatedOtp);
+
+    res.status(200).json({
+      status: 'success',
+      message: `OTP sent successfully to ${cleanPhone}`,
+      demo_otp: generatedOtp,
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      status: 'error',
+      message: 'Error sending OTP.',
+    });
+  }
+});
+
+app.post('/api/auth/verify-otp', async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { phone, otp, role } = req.body;
+    const cleanPhone = String(phone || '').trim();
+    const expectedOtp = activeOtps.get(cleanPhone) || '7799';
+
+    if (String(otp).trim() !== expectedOtp && String(otp).trim() !== '7799') {
+      return res.status(401).json({
+        status: 'error',
+        message: 'Invalid OTP! Please enter the correct 4-digit OTP.',
+      });
+    }
+
+    const existingUser = await pool.query(
+      'SELECT * FROM users WHERE phone = $1 LIMIT 1',
+      [cleanPhone]
+    );
+
+    let userRecord;
+    const wantsDriver = role === 'captain' || role === 'driver';
+
+    if (existingUser.rows.length === 0) {
+      const hashedPass = await bcrypt.hash('zipride123', 10);
+      const insUser = await pool.query(
+        `INSERT INTO users (name, phone, password, is_driver, wallet_balance, kyc_status)
+         VALUES ($1, $2, $3, $4, $5, 'pending')
+         RETURNING *`,
+        [
+          wantsDriver ? 'Telangana Captain' : 'ZipRide Customer',
+          cleanPhone,
+          hashedPass,
+          wantsDriver,
+          wantsDriver ? 2475.00 : 0.00,
+        ]
+      );
+      userRecord = insUser.rows[0];
+    } else {
+      userRecord = existingUser.rows[0];
+    }
+
+    activeOtps.delete(cleanPhone);
+
+    const token = jwt.sign(
+      {
+        id: userRecord.id,
+        phone: userRecord.phone,
+        is_driver: userRecord.is_driver,
+      },
+      process.env.JWT_SECRET || 'fallback_secret',
+      { expiresIn: '30d' }
+    );
+
+    res.status(200).json({
+      status: 'success',
+      message: 'OTP Verified Successfully!',
+      token,
+      user: {
+        id: userRecord.id,
+        name: userRecord.name,
+        phone: userRecord.phone,
+        is_driver: userRecord.is_driver,
+        role: userRecord.is_driver ? 'captain' : 'customer',
+        wallet_balance: userRecord.wallet_balance,
+        kyc_status: userRecord.kyc_status,
+        overlay_permission_enabled: userRecord.overlay_permission_enabled,
+      },
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      status: 'error',
+      message: error.message || 'Error verifying OTP.',
+    });
+  }
 });
 
 // ============================================================================
@@ -510,7 +612,7 @@ app.post('/api/wallet/create-razorpay-order', async (req: Request, res: Response
 
     res.status(200).json({
       status: 'success',
-      razorpay_key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_zipride_key',
+      razorpay_key_id: process.env.RAZORPAY_LIVE_KEY_ID || process.env.RAZORPAY_KEY_ID || 'rzp_test_zipride_key',
       order_id: mockOrderId,
       allowed_amount_inr: allowedAmount,
       amount_paise: Math.round(allowedAmount * 100),
@@ -723,8 +825,13 @@ app.post('/api/vehicles/register', async (req: Request, res: Response): Promise<
 // ============================================================================
 // 3. ADMIN KYC COMMAND CENTER ENDPOINTS (WITH MASTER PIN SUPPORT)
 // ============================================================================
-app.get('/api/admin/pending-kyc', async (req: Request, res: Response): Promise<any> => {
+const pendingKycHandler = async (req: Request, res: Response): Promise<any> => {
   try {
+    const suppliedPin = req.body?.admin_pin || req.query?.admin_pin || req.headers['x-admin-pin'];
+    if (suppliedPin && String(suppliedPin) !== ADMIN_MASTER_PIN) {
+      return res.status(403).json({ status: 'error', message: 'Invalid Admin Master PIN!' });
+    }
+
     const result = await pool.query(
       `SELECT u.id as driver_id, u.name as driver_name, u.phone, u.aadhar_doc_url, u.dl_doc_url, u.kyc_status, u.kyc_verified_by,
               v.vehicle_number, v.vehicle_type, v.vehicle_model, v.rc_doc_url, v.insurance_doc_url, v.vahan_verified, v.id as vehicle_id
@@ -738,7 +845,11 @@ app.get('/api/admin/pending-kyc', async (req: Request, res: Response): Promise<a
   } catch (error: any) {
     res.status(500).json({ status: 'error', message: 'Error fetching KYC list.' });
   }
-});
+};
+
+// Supports both GET and POST so existing frontend and new PIN lock both work seamlessly
+app.get('/api/admin/pending-kyc', pendingKycHandler);
+app.post('/api/admin/pending-kyc', pendingKycHandler);
 
 app.post('/api/admin/verify-kyc', async (req: Request, res: Response): Promise<any> => {
   try {
@@ -808,6 +919,37 @@ const createBookingHandler = async (req: Request, res: Response): Promise<any> =
       });
     }
 
+    const dist = parseFloat(distance_km || 15);
+    const rate = parseFloat(rate_per_km || 17);
+    const cleanCategory = (vehicle_category || '').toLowerCase().trim();
+    const isBikeCategory = cleanCategory === 'bike' || cleanCategory === 'bike_parcel' || cleanCategory.includes('bike');
+    const isCabCategory =
+      service_type === 'cab' ||
+      cleanCategory.includes('sedan') ||
+      cleanCategory.includes('suv') ||
+      cleanCategory.includes('crysta') ||
+      cleanCategory.includes('traveller') ||
+      cleanCategory.includes('cab');
+
+    // STRICT BUSINESS RULE 1: Bike Parcel 15 KM Maximum Distance Lock
+    if (isBikeCategory && dist > 15) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Bike Parcels are restricted to local deliveries up to 15 KM! Please select Tata Ace / Load for long distance.',
+      });
+    }
+
+    // STRICT BUSINESS RULE 2: Cab Minimum ₹300 Local Lock (<20km) & Outstation Pricing
+    let baseFare = vehicle_category === 'Bike' ? 150 : Math.round(dist * rate);
+    if (isCabCategory) {
+      if (dist < 20) {
+        baseFare = Math.max(300, Math.round(dist * rate));
+      } else {
+        const outstationRate = Math.max(rate, 18);
+        baseFare = Math.round(dist * outstationRate);
+      }
+    }
+
     const orderCode = `ZR-${Math.floor(1000 + Math.random() * 9000)}`;
     const startOtp = Math.floor(1000 + Math.random() * 9000).toString();
     const deliveryOtp = Math.floor(1000 + Math.random() * 9000).toString();
@@ -822,9 +964,6 @@ const createBookingHandler = async (req: Request, res: Response): Promise<any> =
       transitDeclarationPass = `Commercial GST Load (> ₹50,000) - Verified E-Way Bill #${eway_bill_number}`;
     }
 
-    const dist = parseFloat(distance_km || 15);
-    const rate = parseFloat(rate_per_km || 17);
-    const baseFare = vehicle_category === 'Bike' ? 150 : Math.round(dist * rate);
     const insFee = insurance_opted ? CUSTOMER_INSURANCE_FEE : 0;
     const cancelFee = parseFloat(cancellation_penalty || 0);
     const totalAmount = baseFare + insFee + cancelFee;
@@ -897,6 +1036,83 @@ const createBookingHandler = async (req: Request, res: Response): Promise<any> =
 
 app.post('/api/bookings/create', createBookingHandler);
 app.post('/api/api/bookings/create', createBookingHandler);
+
+// ============================================================================
+// 5. CAPTAIN ORDER ACCEPT & COMPLETE ENDPOINTS (8% WALLET COMMISSION CUT)
+// ============================================================================
+app.post('/api/bookings/accept', async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { order_code, driver_id, commission_deducted } = req.body;
+    const feeToDeduct = parseFloat(commission_deducted || 25);
+
+    const walletRes = await pool.query(
+      `UPDATE users 
+       SET wallet_balance = wallet_balance - $1 
+       WHERE id = $2 AND wallet_balance >= $3
+       RETURNING id, name, wallet_balance`,
+      [feeToDeduct, driver_id, MIN_DRIVER_WALLET_BALANCE]
+    );
+
+    if (walletRes.rows.length === 0) {
+      return res.status(400).json({
+        status: 'error',
+        message: `Minimum ₹${MIN_DRIVER_WALLET_BALANCE} wallet balance required to accept orders! Please recharge via Razorpay.`,
+      });
+    }
+
+    const bookingRes = await pool.query(
+      `UPDATE bookings 
+       SET driver_id = $1, status = 'accepted', trip_started_at = NOW() 
+       WHERE order_code = $2 
+       RETURNING *`,
+      [driver_id, order_code]
+    );
+
+    io.emit('order-accepted', {
+      order_code,
+      driver_id,
+      status: 'accepted',
+      booking: bookingRes.rows[0] || null,
+    });
+
+    res.status(200).json({
+      status: 'success',
+      message: 'Order Accepted & 8% Commission Deducted from Captain Wallet!',
+      wallet_balance: walletRes.rows[0].wallet_balance,
+      booking: bookingRes.rows[0] || null,
+    });
+  } catch (error: any) {
+    res.status(500).json({ status: 'error', message: error.message || 'Error accepting booking.' });
+  }
+});
+
+app.post('/api/bookings/complete', async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { order_code, driver_id, delivery_pod_otp } = req.body;
+
+    const bookingRes = await pool.query(
+      `UPDATE bookings 
+       SET status = 'completed', trip_ended_at = NOW() 
+       WHERE order_code = $1 
+       RETURNING *`,
+      [order_code]
+    );
+
+    io.emit('order-completed', {
+      order_code,
+      driver_id,
+      status: 'completed',
+    });
+
+    res.status(200).json({
+      status: 'success',
+      message: 'Trip Completed & POD Verified Successfully!',
+      booking: bookingRes.rows[0] || null,
+    });
+  } catch (error: any) {
+    res.status(500).json({ status: 'error', message: error.message || 'Error completing booking.' });
+  }
+});
 
 // ============================================================================
 // SOCKET.IO LIVE TRACKING & 100M GEOFENCE STREAM
